@@ -1,0 +1,684 @@
+ 1 /* Copyright (c) 2002,2003,2004,2005,2006,2007,2008,2009  Eric B. Weddington
+    2    All rights reserved.
+    3 
+    4    Redistribution and use in source and binary forms, with or without
+    5    modification, are permitted provided that the following conditions are met:
+    6 
+    7    * Redistributions of source code must retain the above copyright
+    8      notice, this list of conditions and the following disclaimer.
+    9    * Redistributions in binary form must reproduce the above copyright
+   10      notice, this list of conditions and the following disclaimer in
+   11      the documentation and/or other materials provided with the
+   12      distribution.
+   13    * Neither the name of the copyright holders nor the names of
+   14      contributors may be used to endorse or promote products derived
+   15      from this software without specific prior written permission.
+   16 
+   17   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+   18   AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+   19   IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+   20   ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+   21   LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+   22   CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+   23   SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+   24   INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+   25   CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+   26   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+   27   POSSIBILITY OF SUCH DAMAGE. */
+   28 
+   29 /* $Id: boot_8h_source.html,v 1.1.1.6 2016/02/09 07:13:40 joerg_wunsch Exp $ */
+   30 
+   31 #ifndef _AVR_BOOT_H_
+   32 #define _AVR_BOOT_H_    1
+   33 
+   34 /** \file */
+   35 /** \defgroup avr_boot <avr/boot.h>: Bootloader Support Utilities
+   36     \code
+   37     #include <avr/io.h>
+   38     #include <avr/boot.h>
+   39     \endcode
+   40 
+   41     The macros in this module provide a C language interface to the
+   42     bootloader support functionality of certain AVR processors. These
+   43     macros are designed to work with all sizes of flash memory.
+   44 
+   45     Global interrupts are not automatically disabled for these macros. It
+   46     is left up to the programmer to do this. See the code example below. 
+   47     Also see the processor datasheet for caveats on having global interrupts 
+   48     enabled during writing of the Flash.
+   49 
+   50     \note Not all AVR processors provide bootloader support. See your
+   51     processor datasheet to see if it provides bootloader support.
+   52 
+   53     \todo From email with Marek: On smaller devices (all except ATmega64/128),
+   54     __SPM_REG is in the I/O space, accessible with the shorter "in" and "out"
+   55     instructions - since the boot loader has a limited size, this could be an
+   56     important optimization.
+   57 
+   58     \par API Usage Example
+   59     The following code shows typical usage of the boot API.
+   60 
+   61     \code
+   62     #include <inttypes.h>
+   63     #include <avr/interrupt.h>
+   64     #include <avr/pgmspace.h>
+   65     
+   66     void boot_program_page (uint32_t page, uint8_t *buf)
+   67     {
+   68         uint16_t i;
+   69         uint8_t sreg;
+   70 
+   71         // Disable interrupts.
+   72 
+   73         sreg = SREG;
+   74         cli();
+   75     
+   76         eeprom_busy_wait ();
+   77 
+   78         boot_page_erase (page);
+   79         boot_spm_busy_wait ();      // Wait until the memory is erased.
+   80 
+   81         for (i=0; i<SPM_PAGESIZE; i+=2)
+   82         {
+   83             // Set up little-endian word.
+   84 
+   85             uint16_t w = *buf++;
+   86             w += (*buf++) << 8;
+   87         
+   88             boot_page_fill (page + i, w);
+   89         }
+   90 
+   91         boot_page_write (page);     // Store buffer in flash page.
+   92         boot_spm_busy_wait();       // Wait until the memory is written.
+   93 
+   94         // Reenable RWW-section again. We need this if we want to jump back
+   95         // to the application after bootloading.
+   96 
+   97         boot_rww_enable ();
+   98 
+   99         // Re-enable interrupts (if they were ever enabled).
+  100 
+  101         SREG = sreg;
+  102     }\endcode */
+  103 
+  104 #include <avr/eeprom.h>
+  105 #include <avr/io.h>
+  106 #include <inttypes.h>
+  107 #include <limits.h>
+  108 
+  109 /* Check for SPM Control Register in processor. */
+  110 #if defined (SPMCSR)
+  111 #  define __SPM_REG    SPMCSR
+  112 #else
+  113 #  if defined (SPMCR)
+  114 #    define __SPM_REG    SPMCR
+  115 #  else
+  116 #    error AVR processor does not provide bootloader support!
+  117 #  endif
+  118 #endif
+  119 
+  120 
+  121 /* Check for SPM Enable bit. */
+  122 #if defined(SPMEN)
+  123 #  define __SPM_ENABLE  SPMEN
+  124 #elif defined(SELFPRGEN)
+  125 #  define __SPM_ENABLE  SELFPRGEN
+  126 #else
+  127 #  error Cannot find SPM Enable bit definition!
+  128 #endif
+  129 
+  130 /** \ingroup avr_boot
+  131     \def BOOTLOADER_SECTION
+  132 
+  133     Used to declare a function or variable to be placed into a
+  134     new section called .bootloader. This section and its contents
+  135     can then be relocated to any address (such as the bootloader
+  136     NRWW area) at link-time. */
+  137 
+  138 #define BOOTLOADER_SECTION    __attribute__ ((section (".bootloader")))
+  139 
+  140 #ifndef __DOXYGEN__
+  141 /* Create common bit definitions. */
+  142 #ifdef ASB
+  143 #define __COMMON_ASB    ASB
+  144 #else
+  145 #define __COMMON_ASB    RWWSB
+  146 #endif
+  147 
+  148 #ifdef ASRE
+  149 #define __COMMON_ASRE   ASRE
+  150 #else
+  151 #define __COMMON_ASRE   RWWSRE
+  152 #endif
+  153 
+  154 /* Define the bit positions of the Boot Lock Bits. */
+  155 
+  156 #define BLB12           5
+  157 #define BLB11           4
+  158 #define BLB02           3
+  159 #define BLB01           2
+  160 #endif  /* __DOXYGEN__ */
+  161 
+  162 /** \ingroup avr_boot
+  163     \def boot_spm_interrupt_enable()
+  164     Enable the SPM interrupt. */
+  165 
+  166 #define boot_spm_interrupt_enable()   (__SPM_REG |= (uint8_t)_BV(SPMIE))
+  167 
+  168 /** \ingroup avr_boot
+  169     \def boot_spm_interrupt_disable()
+  170     Disable the SPM interrupt. */
+  171 
+  172 #define boot_spm_interrupt_disable()  (__SPM_REG &= (uint8_t)~_BV(SPMIE))
+  173 
+  174 /** \ingroup avr_boot
+  175     \def boot_is_spm_interrupt()
+  176     Check if the SPM interrupt is enabled. */
+  177 
+  178 #define boot_is_spm_interrupt()       (__SPM_REG & (uint8_t)_BV(SPMIE))
+  179 
+  180 /** \ingroup avr_boot
+  181     \def boot_rww_busy()
+  182     Check if the RWW section is busy. */
+  183 
+  184 #define boot_rww_busy()          (__SPM_REG & (uint8_t)_BV(__COMMON_ASB))
+  185 
+  186 /** \ingroup avr_boot
+  187     \def boot_spm_busy()
+  188     Check if the SPM instruction is busy. */
+  189 
+  190 #define boot_spm_busy()               (__SPM_REG & (uint8_t)_BV(__SPM_ENABLE))
+  191 
+  192 /** \ingroup avr_boot
+  193     \def boot_spm_busy_wait()
+  194     Wait while the SPM instruction is busy. */
+  195 
+  196 #define boot_spm_busy_wait()          do{}while(boot_spm_busy())
+  197 
+  198 #ifndef __DOXYGEN__
+  199 #define __BOOT_PAGE_ERASE         (_BV(__SPM_ENABLE) | _BV(PGERS))
+  200 #define __BOOT_PAGE_WRITE         (_BV(__SPM_ENABLE) | _BV(PGWRT))
+  201 #define __BOOT_PAGE_FILL          _BV(__SPM_ENABLE)
+  202 #define __BOOT_RWW_ENABLE         (_BV(__SPM_ENABLE) | _BV(__COMMON_ASRE))
+  203 #if defined(BLBSET)
+  204 #define __BOOT_LOCK_BITS_SET      (_BV(__SPM_ENABLE) | _BV(BLBSET))
+  205 #elif defined(RFLB)  /* Some devices have RFLB defined instead of BLBSET. */
+  206 #define __BOOT_LOCK_BITS_SET      (_BV(__SPM_ENABLE) | _BV(RFLB))
+  207 #endif
+  208 
+  209 #define __boot_page_fill_normal(address, data)   \
+  210 (__extension__({                                 \
+  211     __asm__ __volatile__                         \
+  212     (                                            \
+  213         "movw  r0, %3\n\t"                       \
+  214         "sts %0, %1\n\t"                         \
+  215         "spm\n\t"                                \
+  216         "clr  r1\n\t"                            \
+  217         :                                        \
+  218         : "i" (_SFR_MEM_ADDR(__SPM_REG)),        \
+  219           "r" ((uint8_t)(__BOOT_PAGE_FILL)),     \
+  220           "z" ((uint16_t)(address)),             \
+  221           "r" ((uint16_t)(data))                 \
+  222         : "r0"                                   \
+  223     );                                           \
+  224 }))
+  225 
+  226 #define __boot_page_fill_alternate(address, data)\
+  227 (__extension__({                                 \
+  228     __asm__ __volatile__                         \
+  229     (                                            \
+  230         "movw  r0, %3\n\t"                       \
+  231         "sts %0, %1\n\t"                         \
+  232         "spm\n\t"                                \
+  233         ".word 0xffff\n\t"                       \
+  234         "nop\n\t"                                \
+  235         "clr  r1\n\t"                            \
+  236         :                                        \
+  237         : "i" (_SFR_MEM_ADDR(__SPM_REG)),        \
+  238           "r" ((uint8_t)(__BOOT_PAGE_FILL)),     \
+  239           "z" ((uint16_t)(address)),             \
+  240           "r" ((uint16_t)(data))                 \
+  241         : "r0"                                   \
+  242     );                                           \
+  243 }))
+  244 
+  245 #define __boot_page_fill_extended(address, data) \
+  246 (__extension__({                                 \
+  247     __asm__ __volatile__                         \
+  248     (                                            \
+  249         "movw  r0, %4\n\t"                       \
+  250         "movw r30, %A3\n\t"                      \
+  251         "sts %1, %C3\n\t"                        \
+  252         "sts %0, %2\n\t"                         \
+  253         "spm\n\t"                                \
+  254         "clr  r1\n\t"                            \
+  255         :                                        \
+  256         : "i" (_SFR_MEM_ADDR(__SPM_REG)),        \
+  257           "i" (_SFR_MEM_ADDR(RAMPZ)),            \
+  258           "r" ((uint8_t)(__BOOT_PAGE_FILL)),     \
+  259           "r" ((uint32_t)(address)),             \
+  260           "r" ((uint16_t)(data))                 \
+  261         : "r0", "r30", "r31"                     \
+  262     );                                           \
+  263 }))
+  264 
+  265 #define __boot_page_erase_normal(address)        \
+  266 (__extension__({                                 \
+  267     __asm__ __volatile__                         \
+  268     (                                            \
+  269         "sts %0, %1\n\t"                         \
+  270         "spm\n\t"                                \
+  271         :                                        \
+  272         : "i" (_SFR_MEM_ADDR(__SPM_REG)),        \
+  273           "r" ((uint8_t)(__BOOT_PAGE_ERASE)),    \
+  274           "z" ((uint16_t)(address))              \
+  275     );                                           \
+  276 }))
+  277 
+  278 #define __boot_page_erase_alternate(address)     \
+  279 (__extension__({                                 \
+  280     __asm__ __volatile__                         \
+  281     (                                            \
+  282         "sts %0, %1\n\t"                         \
+  283         "spm\n\t"                                \
+  284         ".word 0xffff\n\t"                       \
+  285         "nop\n\t"                                \
+  286         :                                        \
+  287         : "i" (_SFR_MEM_ADDR(__SPM_REG)),        \
+  288           "r" ((uint8_t)(__BOOT_PAGE_ERASE)),    \
+  289           "z" ((uint16_t)(address))              \
+  290     );                                           \
+  291 }))
+  292 
+  293 #define __boot_page_erase_extended(address)      \
+  294 (__extension__({                                 \
+  295     __asm__ __volatile__                         \
+  296     (                                            \
+  297         "movw r30, %A3\n\t"                      \
+  298         "sts  %1, %C3\n\t"                       \
+  299         "sts %0, %2\n\t"                         \
+  300         "spm\n\t"                                \
+  301         :                                        \
+  302         : "i" (_SFR_MEM_ADDR(__SPM_REG)),        \
+  303           "i" (_SFR_MEM_ADDR(RAMPZ)),            \
+  304           "r" ((uint8_t)(__BOOT_PAGE_ERASE)),    \
+  305           "r" ((uint32_t)(address))              \
+  306         : "r30", "r31"                           \
+  307     );                                           \
+  308 }))
+  309 
+  310 #define __boot_page_write_normal(address)        \
+  311 (__extension__({                                 \
+  312     __asm__ __volatile__                         \
+  313     (                                            \
+  314         "sts %0, %1\n\t"                         \
+  315         "spm\n\t"                                \
+  316         :                                        \
+  317         : "i" (_SFR_MEM_ADDR(__SPM_REG)),        \
+  318           "r" ((uint8_t)(__BOOT_PAGE_WRITE)),    \
+  319           "z" ((uint16_t)(address))              \
+  320     );                                           \
+  321 }))
+  322 
+  323 #define __boot_page_write_alternate(address)     \
+  324 (__extension__({                                 \
+  325     __asm__ __volatile__                         \
+  326     (                                            \
+  327         "sts %0, %1\n\t"                         \
+  328         "spm\n\t"                                \
+  329         ".word 0xffff\n\t"                       \
+  330         "nop\n\t"                                \
+  331         :                                        \
+  332         : "i" (_SFR_MEM_ADDR(__SPM_REG)),        \
+  333           "r" ((uint8_t)(__BOOT_PAGE_WRITE)),    \
+  334           "z" ((uint16_t)(address))              \
+  335     );                                           \
+  336 }))
+  337 
+  338 #define __boot_page_write_extended(address)      \
+  339 (__extension__({                                 \
+  340     __asm__ __volatile__                         \
+  341     (                                            \
+  342         "movw r30, %A3\n\t"                      \
+  343         "sts %1, %C3\n\t"                        \
+  344         "sts %0, %2\n\t"                         \
+  345         "spm\n\t"                                \
+  346         :                                        \
+  347         : "i" (_SFR_MEM_ADDR(__SPM_REG)),        \
+  348           "i" (_SFR_MEM_ADDR(RAMPZ)),            \
+  349           "r" ((uint8_t)(__BOOT_PAGE_WRITE)),    \
+  350           "r" ((uint32_t)(address))              \
+  351         : "r30", "r31"                           \
+  352     );                                           \
+  353 }))
+  354 
+  355 #define __boot_rww_enable()                      \
+  356 (__extension__({                                 \
+  357     __asm__ __volatile__                         \
+  358     (                                            \
+  359         "sts %0, %1\n\t"                         \
+  360         "spm\n\t"                                \
+  361         :                                        \
+  362         : "i" (_SFR_MEM_ADDR(__SPM_REG)),        \
+  363           "r" ((uint8_t)(__BOOT_RWW_ENABLE))     \
+  364     );                                           \
+  365 }))
+  366 
+  367 #define __boot_rww_enable_alternate()            \
+  368 (__extension__({                                 \
+  369     __asm__ __volatile__                         \
+  370     (                                            \
+  371         "sts %0, %1\n\t"                         \
+  372         "spm\n\t"                                \
+  373         ".word 0xffff\n\t"                       \
+  374         "nop\n\t"                                \
+  375         :                                        \
+  376         : "i" (_SFR_MEM_ADDR(__SPM_REG)),        \
+  377           "r" ((uint8_t)(__BOOT_RWW_ENABLE))     \
+  378     );                                           \
+  379 }))
+  380 
+  381 /* From the mega16/mega128 data sheets (maybe others):
+  382 
+  383      Bits by SPM To set the Boot Loader Lock bits, write the desired data to
+  384      R0, write "X0001001" to SPMCR and execute SPM within four clock cycles
+  385      after writing SPMCR. The only accessible Lock bits are the Boot Lock bits
+  386      that may prevent the Application and Boot Loader section from any
+  387      software update by the MCU.
+  388 
+  389      If bits 5..2 in R0 are cleared (zero), the corresponding Boot Lock bit
+  390      will be programmed if an SPM instruction is executed within four cycles
+  391      after BLBSET and SPMEN (or SELFPRGEN) are set in SPMCR. The Z-pointer is 
+  392      don't care during this operation, but for future compatibility it is 
+  393      recommended to load the Z-pointer with $0001 (same as used for reading the 
+  394      Lock bits). For future compatibility It is also recommended to set bits 7, 
+  395      6, 1, and 0 in R0 to 1 when writing the Lock bits. When programming the 
+  396      Lock bits the entire Flash can be read during the operation. */
+  397 
+  398 #define __boot_lock_bits_set(lock_bits)                    \
+  399 (__extension__({                                           \
+  400     uint8_t value = (uint8_t)(~(lock_bits));               \
+  401     __asm__ __volatile__                                   \
+  402     (                                                      \
+  403         "ldi r30, 1\n\t"                                   \
+  404         "ldi r31, 0\n\t"                                   \
+  405         "mov r0, %2\n\t"                                   \
+  406         "sts %0, %1\n\t"                                   \
+  407         "spm\n\t"                                          \
+  408         :                                                  \
+  409         : "i" (_SFR_MEM_ADDR(__SPM_REG)),                  \
+  410           "r" ((uint8_t)(__BOOT_LOCK_BITS_SET)),           \
+  411           "r" (value)                                      \
+  412         : "r0", "r30", "r31"                               \
+  413     );                                                     \
+  414 }))
+  415 
+  416 #define __boot_lock_bits_set_alternate(lock_bits)          \
+  417 (__extension__({                                           \
+  418     uint8_t value = (uint8_t)(~(lock_bits));               \
+  419     __asm__ __volatile__                                   \
+  420     (                                                      \
+  421         "ldi r30, 1\n\t"                                   \
+  422         "ldi r31, 0\n\t"                                   \
+  423         "mov r0, %2\n\t"                                   \
+  424         "sts %0, %1\n\t"                                   \
+  425         "spm\n\t"                                          \
+  426         ".word 0xffff\n\t"                                 \
+  427         "nop\n\t"                                          \
+  428         :                                                  \
+  429         : "i" (_SFR_MEM_ADDR(__SPM_REG)),                  \
+  430           "r" ((uint8_t)(__BOOT_LOCK_BITS_SET)),           \
+  431           "r" (value)                                      \
+  432         : "r0", "r30", "r31"                               \
+  433     );                                                     \
+  434 }))
+  435 #endif  /* __DOXYGEN__ */
+  436 
+  437 /*
+  438    Reading lock and fuse bits:
+  439 
+  440      Similarly to writing the lock bits above, set BLBSET and SPMEN (or 
+  441      SELFPRGEN) bits in __SPMREG, and then (within four clock cycles) issue an 
+  442      LPM instruction.
+  443 
+  444      Z address:       contents:
+  445      0x0000           low fuse bits
+  446      0x0001           lock bits
+  447      0x0002           extended fuse bits
+  448      0x0003           high fuse bits
+  449 
+  450      Sounds confusing, doesn't it?
+  451 
+  452      Unlike the macros in pgmspace.h, no need to care for non-enhanced
+  453      cores here as these old cores do not provide SPM support anyway.
+  454  */
+  455 
+  456 /** \ingroup avr_boot
+  457     \def GET_LOW_FUSE_BITS
+  458     address to read the low fuse bits, using boot_lock_fuse_bits_get
+  459  */
+  460 #define GET_LOW_FUSE_BITS           (0x0000)
+  461 /** \ingroup avr_boot
+  462     \def GET_LOCK_BITS
+  463     address to read the lock bits, using boot_lock_fuse_bits_get
+  464  */
+  465 #define GET_LOCK_BITS               (0x0001)
+  466 /** \ingroup avr_boot
+  467     \def GET_EXTENDED_FUSE_BITS
+  468     address to read the extended fuse bits, using boot_lock_fuse_bits_get
+  469  */
+  470 #define GET_EXTENDED_FUSE_BITS      (0x0002)
+  471 /** \ingroup avr_boot
+  472     \def GET_HIGH_FUSE_BITS
+  473     address to read the high fuse bits, using boot_lock_fuse_bits_get
+  474  */
+  475 #define GET_HIGH_FUSE_BITS          (0x0003)
+  476 
+  477 /** \ingroup avr_boot
+  478     \def boot_lock_fuse_bits_get(address)
+  479 
+  480     Read the lock or fuse bits at \c address.
+  481 
+  482     Parameter \c address can be any of GET_LOW_FUSE_BITS,
+  483     GET_LOCK_BITS, GET_EXTENDED_FUSE_BITS, or GET_HIGH_FUSE_BITS.
+  484 
+  485     \note The lock and fuse bits returned are the physical values,
+  486     i.e. a bit returned as 0 means the corresponding fuse or lock bit
+  487     is programmed.
+  488  */
+  489 #define boot_lock_fuse_bits_get(address)                   \
+  490 (__extension__({                                           \
+  491     uint8_t __result;                                      \
+  492     __asm__ __volatile__                                   \
+  493     (                                                      \
+  494         "sts %1, %2\n\t"                                   \
+  495         "lpm %0, Z\n\t"                                    \
+  496         : "=r" (__result)                                  \
+  497         : "i" (_SFR_MEM_ADDR(__SPM_REG)),                  \
+  498           "r" ((uint8_t)(__BOOT_LOCK_BITS_SET)),           \
+  499           "z" ((uint16_t)(address))                        \
+  500     );                                                     \
+  501     __result;                                              \
+  502 }))
+  503 
+  504 #ifndef __DOXYGEN__
+  505 #define __BOOT_SIGROW_READ (_BV(__SPM_ENABLE) | _BV(SIGRD))
+  506 #endif
+  507 /** \ingroup avr_boot
+  508     \def boot_signature_byte_get(address)
+  509 
+  510     Read the Signature Row byte at \c address.  For some MCU types,
+  511     this function can also retrieve the factory-stored oscillator
+  512     calibration bytes.
+  513 
+  514     Parameter \c address can be 0-0x1f as documented by the datasheet.
+  515     \note The values are MCU type dependent.
+  516 */
+  517 
+  518 #define boot_signature_byte_get(addr) \
+  519 (__extension__({                      \
+  520       uint8_t __result;                         \
+  521       __asm__ __volatile__                      \
+  522       (                                         \
+  523         "sts %1, %2\n\t"                        \
+  524         "lpm %0, Z" "\n\t"                      \
+  525         : "=r" (__result)                       \
+  526         : "i" (_SFR_MEM_ADDR(__SPM_REG)),       \
+  527           "r" ((uint8_t)(__BOOT_SIGROW_READ)),  \
+  528           "z" ((uint16_t)(addr))                \
+  529       );                                        \
+  530       __result;                                 \
+  531 }))
+  532 
+  533 /** \ingroup avr_boot
+  534     \def boot_page_fill(address, data)
+  535 
+  536     Fill the bootloader temporary page buffer for flash 
+  537     address with data word. 
+  538 
+  539     \note The address is a byte address. The data is a word. The AVR 
+  540     writes data to the buffer a word at a time, but addresses the buffer
+  541     per byte! So, increment your address by 2 between calls, and send 2
+  542     data bytes in a word format! The LSB of the data is written to the lower 
+  543     address; the MSB of the data is written to the higher address.*/
+  544 
+  545 /** \ingroup avr_boot
+  546     \def boot_page_erase(address)
+  547 
+  548     Erase the flash page that contains address.
+  549 
+  550     \note address is a byte address in flash, not a word address. */
+  551 
+  552 /** \ingroup avr_boot
+  553     \def boot_page_write(address)
+  554 
+  555     Write the bootloader temporary page buffer 
+  556     to flash page that contains address.
+  557     
+  558     \note address is a byte address in flash, not a word address. */
+  559 
+  560 /** \ingroup avr_boot
+  561     \def boot_rww_enable()
+  562 
+  563     Enable the Read-While-Write memory section. */
+  564 
+  565 /** \ingroup avr_boot
+  566     \def boot_lock_bits_set(lock_bits)
+  567 
+  568     Set the bootloader lock bits.
+  569 
+  570     \param lock_bits A mask of which Boot Loader Lock Bits to set.
+  571 
+  572     \note In this context, a 'set bit' will be written to a zero value.
+  573     Note also that only BLBxx bits can be programmed by this command.
+  574 
+  575     For example, to disallow the SPM instruction from writing to the Boot
+  576     Loader memory section of flash, you would use this macro as such:
+  577 
+  578     \code
+  579     boot_lock_bits_set (_BV (BLB11));
+  580     \endcode
+  581 
+  582     \note Like any lock bits, the Boot Loader Lock Bits, once set,
+  583     cannot be cleared again except by a chip erase which will in turn
+  584     also erase the boot loader itself. */
+  585 
+  586 /* Normal versions of the macros use 16-bit addresses.
+  587    Extended versions of the macros use 32-bit addresses.
+  588    Alternate versions of the macros use 16-bit addresses and require special
+  589    instruction sequences after LPM.
+  590 
+  591    FLASHEND is defined in the ioXXXX.h file.
+  592    USHRT_MAX is defined in <limits.h>. */ 
+  593 
+  594 #if defined(__AVR_ATmega161__) || defined(__AVR_ATmega163__) \
+  595     || defined(__AVR_ATmega323__)
+  596 
+  597 /* Alternate: ATmega161/163/323 and 16 bit address */
+  598 #define boot_page_fill(address, data) __boot_page_fill_alternate(address, data)
+  599 #define boot_page_erase(address)      __boot_page_erase_alternate(address)
+  600 #define boot_page_write(address)      __boot_page_write_alternate(address)
+  601 #define boot_rww_enable()             __boot_rww_enable_alternate()
+  602 #define boot_lock_bits_set(lock_bits) __boot_lock_bits_set_alternate(lock_bits)
+  603 
+  604 #elif (FLASHEND > USHRT_MAX)
+  605 
+  606 /* Extended: >16 bit address */
+  607 #define boot_page_fill(address, data) __boot_page_fill_extended(address, data)
+  608 #define boot_page_erase(address)      __boot_page_erase_extended(address)
+  609 #define boot_page_write(address)      __boot_page_write_extended(address)
+  610 #define boot_rww_enable()             __boot_rww_enable()
+  611 #define boot_lock_bits_set(lock_bits) __boot_lock_bits_set(lock_bits)
+  612 
+  613 #else
+  614 
+  615 /* Normal: 16 bit address */
+  616 #define boot_page_fill(address, data) __boot_page_fill_normal(address, data)
+  617 #define boot_page_erase(address)      __boot_page_erase_normal(address)
+  618 #define boot_page_write(address)      __boot_page_write_normal(address)
+  619 #define boot_rww_enable()             __boot_rww_enable()
+  620 #define boot_lock_bits_set(lock_bits) __boot_lock_bits_set(lock_bits)
+  621 
+  622 #endif
+  623 
+  624 /** \ingroup avr_boot
+  625 
+  626     Same as boot_page_fill() except it waits for eeprom and spm operations to
+  627     complete before filling the page. */
+  628 
+  629 #define boot_page_fill_safe(address, data) \
+  630 do { \
+  631     boot_spm_busy_wait();                       \
+  632     eeprom_busy_wait();                         \
+  633     boot_page_fill(address, data);              \
+  634 } while (0)
+  635 
+  636 /** \ingroup avr_boot
+  637 
+  638     Same as boot_page_erase() except it waits for eeprom and spm operations to
+  639     complete before erasing the page. */
+  640 
+  641 #define boot_page_erase_safe(address) \
+  642 do { \
+  643     boot_spm_busy_wait();                       \
+  644     eeprom_busy_wait();                         \
+  645     boot_page_erase (address);                  \
+  646 } while (0)
+  647 
+  648 /** \ingroup avr_boot
+  649 
+  650     Same as boot_page_write() except it waits for eeprom and spm operations to
+  651     complete before writing the page. */
+  652 
+  653 #define boot_page_write_safe(address) \
+  654 do { \
+  655     boot_spm_busy_wait();                       \
+  656     eeprom_busy_wait();                         \
+  657     boot_page_write (address);                  \
+  658 } while (0)
+  659 
+  660 /** \ingroup avr_boot
+  661 
+  662     Same as boot_rww_enable() except waits for eeprom and spm operations to
+  663     complete before enabling the RWW mameory. */
+  664 
+  665 #define boot_rww_enable_safe() \
+  666 do { \
+  667     boot_spm_busy_wait();                       \
+  668     eeprom_busy_wait();                         \
+  669     boot_rww_enable();                          \
+  670 } while (0)
+  671 
+  672 /** \ingroup avr_boot
+  673 
+  674     Same as boot_lock_bits_set() except waits for eeprom and spm operations to
+  675     complete before setting the lock bits. */
+  676 
+  677 #define boot_lock_bits_set_safe(lock_bits) \
+  678 do { \
+  679     boot_spm_busy_wait();                       \
+  680     eeprom_busy_wait();                         \
+  681     boot_lock_bits_set (lock_bits);             \
+  682 } while (0)
+  683 
+  684 #endif /* _AVR_BOOT_H_ */
